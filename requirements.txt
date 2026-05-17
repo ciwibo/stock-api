@@ -3,3 +3,6 @@ gunicorn==21.2.0
 flask-cors
 akshare>=1.17.44,<2.0.0
 pandas
+requests
+urllib3
+fake-useragent
