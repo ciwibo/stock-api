@@ -6,13 +6,18 @@ import logging
 import os
 
 app = Flask(__name__)
-CORS(app) # 重要：解决Android App的跨域访问问题
+CORS(app)
 logging.basicConfig(level=logging.INFO)
 
-# 创建通达信行情客户端
-client = Quotes.factory(market='std')
+# ========== 修改点：手动指定通达信服务器 ==========
+# 使用国内可用的通达信行情服务器（以下IP是常用的，如果失效可以换）
+TDX_HOST = "123.125.108.168"   # 通达信官方服务器之一
+TDX_PORT = 7709                # 通达信行情端口
 
-# 测试用根路由，部署后访问你的域名能看到"Hello from Render!"
+# 创建客户端时直接指定服务器地址，跳过自动测速
+client = Quotes.factory(market='std', host=TDX_HOST, port=TDX_PORT)
+# ===============================================
+
 @app.route('/')
 def home():
     return "Hello from Render! Your Stock API is running."
@@ -20,7 +25,6 @@ def home():
 @app.route('/kline/<code>')
 def get_kline(code):
     try:
-        # 处理股票代码格式
         if code.startswith('sh'):
             market, symbol = 1, code[2:]
         elif code.startswith('sz'):
@@ -28,7 +32,6 @@ def get_kline(code):
         else:
             market, symbol = 0, code
 
-        # 获取日K线数据
         df = client.bars(symbol=symbol, market=market, frequency=9, offset=0, limit=240)
         if df is None or df.empty:
             return jsonify({'error': 'No data'}), 404
@@ -56,7 +59,6 @@ def get_kline(code):
             })
             last_close = price
 
-        # 获取股票名称
         name = code
         try:
             q = client.quotes(symbol=symbol, market=market)
@@ -114,9 +116,6 @@ def get_quote(code):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# 关键：监听 0.0.0.0 和 Render 分配的 PORT 环境变量
 if __name__ == '__main__':
-    # 读取 Render 提供的端口，默认为 10000 用于本地测试
     port = int(os.environ.get('PORT', 10000))
-    # host 必须设为 '0.0.0.0' 才能被外网访问
     app.run(host='0.0.0.0', port=port)
