@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import logging
-import time
+import akshare as ak
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
@@ -12,79 +12,79 @@ app = Flask(__name__)
 CORS(app)
 logging.basicConfig(level=logging.INFO)
 
-# 全局速率控制：每次请求后休眠1秒，避免触发yfinance限流
-REQUEST_DELAY = 1.0
-
-def delay():
-    time.sleep(REQUEST_DELAY)
-
-def convert_code(code):
+# 市场识别函数
+def detect_market(code: str) -> str:
     """
-    将 Android 端传入的代码转换为 yfinance 接受的格式
+    根据股票代码识别所属市场
+    返回: 'a' (A股), 'hk' (港股), 'us' (美股)
     """
-    code_lower = code.lower()
-    if code_lower.isalpha():
+    code_upper = code.upper()
+    # A股规则
+    if (code_upper.startswith('SH') or code_upper.startswith('SZ') or
+        code_upper.startswith('BJ') or (len(code_upper) == 6 and code_upper.isdigit())):
+        return 'a'
+    # 港股规则（带.HK后缀或5位数字）
+    if code_upper.endswith('.HK') or (len(code_upper) == 5 and code_upper.isdigit()):
+        return 'hk'
+    # 其余默认为美股
+    return 'us'
+
+def convert_to_yfinance_code(code: str, market: str) -> str:
+    """将原始代码转换为 yfinance 接受的格式"""
+    if market == 'hk':
+        # 港股需要添加 .HK 后缀并去除可能的前缀
+        raw = code.upper().replace('.HK', '')
+        return f"{raw}.HK"
+    elif market == 'us':
+        # 美股直接使用原代码
         return code.upper()
-    if code_lower.startswith('sh'):
-        return f"{code[2:]}.SS"
-    if code_lower.startswith('sz'):
-        return f"{code[2:]}.SZ"
-    if code_lower.isdigit() and len(code_lower) == 6:
-        if code_lower[0] == '6':
-            return f"{code}.SS"
-        else:
-            return f"{code}.SZ"
-    return code.upper()
+    else:
+        # A股不应进入此分支
+        return code
 
-def get_stock_name(ticker_symbol):
-    """获取股票名称，带重试和延时"""
+def get_stock_name_yfinance(yf_code: str) -> str:
+    """获取美股/港股名称"""
     try:
-        delay()
-        ticker = yf.Ticker(ticker_symbol)
+        ticker = yf.Ticker(yf_code)
         info = ticker.info
-        name = info.get('longName') or info.get('shortName') or ticker_symbol
-        return name
+        return info.get('longName') or info.get('shortName') or yf_code
     except Exception as e:
-        logging.error(f"获取名称失败 {ticker_symbol}: {e}")
-        return ticker_symbol
+        logging.error(f"名称获取失败 {yf_code}: {e}")
+        return yf_code
 
+# ========== 分时K线接口 ==========
 @app.route('/kline/<code>')
 def get_kline(code):
-    """
-    获取1分钟K线（分时线），返回最近240条
-    """
+    """1分钟K线数据（A股240条 / 美股港股120条）"""
+    market = detect_market(code)
+    logging.info(f"K线请求 - 代码: {code} -> 市场: {market}")
+
     try:
-        yf_code = convert_code(code)
-        logging.info(f"请求1分钟K线: {code} -> {yf_code}")
-        delay()  # 限流
-        
-        ticker = yf.Ticker(yf_code)
-        df = ticker.history(period="7d", interval="1m")
-        
-        if df is None or df.empty:
-            return jsonify({'error': f'No 1min kline data for {code}'}), 404
-        
-        df = df.reset_index()
-        df.rename(columns={
-            'Datetime': 'datetime',
-            'Open': 'open',
-            'High': 'high',
-            'Low': 'low',
-            'Close': 'close',
-            'Volume': 'volume'
-        }, inplace=True)
-        
-        # 只取最近240条
-        df = df.tail(240)
-        
+        if market == 'a':
+            # A股：使用 akshare 获取1分钟K线
+            symbol = code.replace('sh', '').replace('sz', '').replace('bj', '')
+            df = ak.stock_zh_a_hist_min_em(symbol=symbol, period='1', adjust='')
+            if df is None or df.empty:
+                return jsonify({'error': f'无法获取 {code} 的K线数据'}), 404
+            df = df.tail(240).reset_index(drop=True)
+            df['时间'] = pd.to_datetime(df['时间'])
+            df['time'] = df['时间'].dt.strftime('%H:%M')
+        else:
+            # 港股/美股：使用 yfinance 获取1分钟K线
+            yf_code = convert_to_yfinance_code(code, market)
+            df = yf.download(yf_code, period='7d', interval='1m', progress=False)
+            if df.empty:
+                return jsonify({'error': f'无法获取 {code} 的K线数据'}), 404
+            df = df.tail(120).reset_index()
+            df['time'] = pd.to_datetime(df['Datetime']).dt.strftime('%H:%M')
+            df.rename(columns={'Close': 'close', 'High': 'high', 'Low': 'low', 'Volume': 'volume'}, inplace=True)
+
+        # 构建返回数据
         minutes = []
         last_close = 0.0
-        total_amount = 0.0
-        total_volume = 0
-        
+        total_amount, total_volume = 0.0, 0
+
         for _, row in df.iterrows():
-            dt = row['datetime']
-            time_str = dt.strftime('%H:%M')
             price = float(row['close'])
             high = float(row['high'])
             low = float(row['low'])
@@ -93,9 +93,9 @@ def get_kline(code):
             total_amount += amount
             total_volume += volume
             avg_price = total_amount / total_volume if total_volume > 0 else price
-            
+
             minutes.append({
-                'time': time_str,
+                'time': row['time'],
                 'price': round(price, 2),
                 'avgPrice': round(avg_price, 2),
                 'lastClose': round(last_close, 2),
@@ -105,121 +105,93 @@ def get_kline(code):
                 'low': round(low, 2)
             })
             last_close = price
-        
-        name = get_stock_name(yf_code)
-        return jsonify({'name': name, 'minutes': minutes})
-    
+
+        return jsonify({'name': code, 'minutes': minutes})
+
     except Exception as e:
-        logging.error(f"Kline error: {e}")
+        logging.error(f"K线接口错误: {e}")
         return jsonify({'error': str(e)}), 500
 
+# ========== 实时行情接口 ==========
 @app.route('/quote/<code>')
 def get_quote(code):
-    """
-    获取实时行情，返回10元素数组
-    """
+    """实时行情（10项数据）"""
+    market = detect_market(code)
+    logging.info(f"实时行情请求 - 代码: {code} -> 市场: {market}")
+
     try:
-        yf_code = convert_code(code)
-        logging.info(f"请求实时行情: {code} -> {yf_code}")
-        delay()  # 限流
-        
-        ticker = yf.Ticker(yf_code)
-        info = ticker.info
-        
-        # 如果 info 为空字典，则尝试从历史数据获取最新价
-        if not info:
-            logging.warning(f"info 为空，尝试从历史数据获取 {yf_code}")
-            hist = ticker.history(period="1d", interval="1m")
-            if not hist.empty:
-                latest = hist['Close'].iloc[-1]
-                last_close = hist['Close'].iloc[0] if len(hist) > 1 else latest
-                high = hist['High'].max()
-                low = hist['Low'].min()
-                change_percent = (latest - last_close) / last_close * 100 if last_close != 0 else 0
-                amplitude = (high - low) / last_close * 100 if last_close != 0 else 0
-                turnover = 0.0
-                volume_ratio = 0.0
-                pe = 0.0
-                mv = 0.0
-            else:
-                return jsonify({'error': f'No quote data for {code}'}), 404
-        else:
-            # 正常从 info 获取
-            latest = info.get('regularMarketPrice') or info.get('currentPrice')
-            if latest is None:
-                # 回退到历史数据
-                hist = ticker.history(period="1d", interval="1m")
-                if not hist.empty:
-                    latest = hist['Close'].iloc[-1]
-                else:
-                    latest = 0.0
-            else:
-                latest = float(latest)
-            
-            last_close = info.get('regularMarketPreviousClose') or info.get('previousClose')
-            if last_close is None:
-                last_close = latest
-            else:
-                last_close = float(last_close)
-            
-            change_percent = (latest - last_close) / last_close * 100 if last_close != 0 else 0.0
-            
-            high = info.get('regularMarketDayHigh') or info.get('dayHigh')
-            low = info.get('regularMarketDayLow') or info.get('dayLow')
-            if high is None:
-                high = latest
-            else:
-                high = float(high)
-            if low is None:
-                low = latest
-            else:
-                low = float(low)
-            
+        if market == 'a':
+            # A股：使用 akshare + 新浪源
+            symbol_raw = code.replace('sh', '').replace('sz', '').replace('bj', '')
+            df = ak.stock_zh_a_spot_em()
+            stock_data = df[df['代码'] == symbol_raw]
+            if stock_data.empty:
+                return jsonify({'error': f'未找到 {code} 的行情数据'}), 404
+
+            row = stock_data.iloc[0]
+            latest = float(row['最新价'])
+            last_close = float(row['昨收'])
+            change_percent = float(row['涨跌幅'])
+            high = float(row['最高'])
+            low = float(row['最低'])
+            turnover = float(row['换手率']) if '换手率' in row else 0.0
             amplitude = (high - low) / last_close * 100 if last_close != 0 else 0.0
+            pe = float(row['市盈率-动态']) if '市盈率-动态' in row else 0.0
+            market_cap = float(row['总市值']) if '总市值' in row else 0.0
+
+        else:
+            # 港股/美股：使用 yfinance
+            yf_code = convert_to_yfinance_code(code, market)
+            ticker = yf.Ticker(yf_code)
+            info = ticker.info
+
+            latest = info.get('regularMarketPrice', 0.0)
+            last_close = info.get('regularMarketPreviousClose', latest)
+            change_percent = (latest - last_close) / last_close * 100 if last_close != 0 else 0.0
+            high = info.get('regularMarketDayHigh', latest)
+            low = info.get('regularMarketDayLow', latest)
             turnover = 0.0
-            volume_ratio = 0.0
-            pe = info.get('trailingPE') or info.get('forwardPE') or 0
-            if pe is not None:
-                pe = float(pe)
-            else:
-                pe = 0.0
-            mv = info.get('marketCap') or 0
-            if mv is not None:
-                mv = float(mv)
-            else:
-                mv = 0.0
-        
-        def fmt_mv(v):
-            if v >= 1e12:
-                return f"{v/1e12:.2f}万亿"
-            elif v >= 1e8:
-                return f"{v/1e8:.2f}亿"
-            elif v == 0:
+            amplitude = (high - low) / last_close * 100 if last_close != 0 else 0.0
+            pe = info.get('trailingPE', 0.0)
+            market_cap = info.get('marketCap', 0.0)
+
+            # 添加股票名称（可选，便于调试）
+            name = get_stock_name_yfinance(yf_code)
+            logging.info(f"实时行情 - {code} 名称: {name}")
+
+        # 格式化市值显示
+        def fmt_market_cap(value):
+            if value >= 1e12:
+                return f"{value/1e12:.2f}万亿"
+            elif value >= 1e8:
+                return f"{value/1e8:.2f}亿"
+            elif value == 0:
                 return "---"
             else:
-                return f"{v/1e4:.2f}万"
-        
+                return f"{value/1e4:.2f}万"
+
         result = [
-            f"{latest:.2f}" if latest != 0 else "---",
-            f"{last_close:.2f}" if last_close != 0 else "---",
-            f"{change_percent:.2f}",
-            f"{turnover:.2f}",
-            f"{volume_ratio:.2f}",
-            f"{amplitude:.2f}",
-            f"{high:.2f}" if high != 0 else "---",
-            f"{low:.2f}" if low != 0 else "---",
-            f"{pe:.2f}" if pe > 0 else "---",
-            fmt_mv(mv)
+            f"{latest:.2f}",            # 最新价
+            f"{last_close:.2f}",        # 昨收
+            f"{change_percent:.2f}",    # 涨跌幅
+            f"{turnover:.2f}",          # 换手率
+            "0.00",                     # 量比（占位）
+            f"{amplitude:.2f}",         # 振幅
+            f"{high:.2f}",              # 最高
+            f"{low:.2f}",               # 最低
+            f"{pe:.2f}" if pe > 0 else "---",  # 市盈率
+            fmt_market_cap(market_cap)  # 总市值
         ]
         return jsonify(result)
-    
+
     except Exception as e:
-        logging.error(f"Quote error: {e}")
+        logging.error(f"实时行情接口错误: {e}")
         return jsonify({'error': str(e)}), 500
 
+# ========== 健康检查接口 ==========
 @app.route('/')
 def home():
-    return "Stock API with yfinance (1min K-line + realtime quote) is running!"
+    return "A股/港股/美股数据服务运行中 (A股使用akshare+新浪，港股美股使用yfinance)"
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
